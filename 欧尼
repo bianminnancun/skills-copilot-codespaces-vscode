@@ -1,0 +1,836 @@
+import sys
+import os
+import time
+import json
+import logging
+import functools
+from pathlib import Path
+from logging.handlers import RotatingFileHandler
+
+# This line is crucial for media playback after packaging with PyInstaller
+# It tells Qt to use the Windows Media Foundation backend.
+os.environ['QT_MULTIMEDIA_PREFERRED_PLUGINS'] = 'windowsmediafoundation'
+
+from PyQt6.QtWidgets import (
+    QApplication, QWidget, QTableWidget, QTableWidgetItem, QPushButton,
+    QVBoxLayout, QHBoxLayout, QHeaderView, QMessageBox, QLabel, QLineEdit,
+    QSpinBox, QSlider, QSystemTrayIcon, QMenu, QInputDialog, QStyle
+)
+from PyQt6.QtCore import (
+    QTimer, Qt, QPropertyAnimation, QPoint, pyqtSignal, QUrl
+)
+from PyQt6.QtGui import QFont, QColor, QBrush, QIcon, QIntValidator, QAction
+from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+
+# --- Logging ---
+LOG_FILE = 'boss_timer.log'
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[RotatingFileHandler(LOG_FILE, maxBytes=1024 * 1024, backupCount=3, encoding='utf-8')]
+)
+
+
+# --- Utility decorator ---
+def handle_exceptions(func):
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return func(self, *args, **kwargs)
+        except Exception as e:
+            logging.exception(f"Unhandled error in {func.__name__}")
+            # Try to show a dialog only when safe
+            try:
+                if isinstance(self, QWidget) or hasattr(self, 'show'):
+                    QMessageBox.critical(
+                        getattr(self, 'parent', None)() if callable(getattr(self, 'parent', None)) else self,
+                        "错误",
+                        f"发生错误: {func.__name__}\n{e}\n详细请查看日志。")
+            except Exception:
+                pass
+
+    return wrapper
+
+
+# --- AlertWindow (新版预警提示窗口) ---
+class AlertWindow(QWidget):
+    closed = pyqtSignal(object)
+
+    def __init__(self, message, duration_ms=8000, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+
+        self.label = QLabel(message, self)
+        self.label.setStyleSheet(
+            "background: rgba(0, 0, 0, 0.75); color: #FF6B6B; padding: 10px; border-radius: 8px; font-size: 16px; font-weight: bold;")
+        self.label.adjustSize()
+
+        total_w = self.label.width() + 40
+        total_h = self.label.height() + 20
+        self.setFixedSize(total_w, total_h)
+
+        screen = QApplication.primaryScreen().availableGeometry()
+        start_x = screen.right() - total_w - 18
+        start_y = screen.top() + 18
+        end_x = screen.left() + 18
+
+        self.move(start_x, start_y)
+
+        # Place label inside the widget
+        self.label.move(20, 10)
+
+        # animate the whole window from right to left
+        self.animation = QPropertyAnimation(self, b"pos", self)
+        self.animation.setDuration(duration_ms)
+        self.animation.setStartValue(QPoint(start_x, start_y))
+        self.animation.setEndValue(QPoint(end_x, start_y))
+        self.animation.finished.connect(self._on_finished)
+
+        # hover to pause
+        self.enterEvent = self._on_enter
+        self.leaveEvent = self._on_leave
+
+        QTimer.singleShot(50, self.animation.start)
+
+    def _on_enter(self, event):
+        if self.animation.state() == QPropertyAnimation.State.Running:
+            self.animation.pause()
+
+    def _on_leave(self, event):
+        if self.animation.state() == QPropertyAnimation.State.Paused:
+            self.animation.resume()
+
+    def _on_finished(self):
+        try:
+            self.closed.emit(self)
+        except Exception:
+            pass
+        self.close()
+
+    def closeEvent(self, ev):
+        try:
+            self.closed.emit(self)
+        except Exception:
+            pass
+        super().closeEvent(ev)
+
+
+# --- TimeInputWidget ---
+class TimeInputWidget(QWidget):
+    editingFinished = pyqtSignal(int)  # seconds
+    editingStarted = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        self.min_lineedit = QLineEdit(self)
+        self.min_lineedit.setValidator(QIntValidator(0, 9999))
+        self.min_lineedit.setFixedSize(120, 36)
+        self.min_lineedit.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        self.min_lineedit.editingFinished.connect(lambda: self.editingFinished.emit(self.get_total_seconds()))
+        self.min_lineedit.textChanged.connect(lambda _: self.editingStarted.emit())
+
+        layout.addStretch()
+        layout.addWidget(self.min_lineedit)
+        layout.addStretch()
+
+    def set_total_seconds(self, total):
+        if total is None or total < 0:
+            total = 0
+        m = total // 60  # use floor division (minutes)
+        self.min_lineedit.blockSignals(True)
+        self.min_lineedit.setText(str(m))
+        self.min_lineedit.blockSignals(False)
+
+    def get_total_seconds(self):
+        try:
+            return int(self.min_lineedit.text()) * 60
+        except Exception:
+            return 0
+
+
+# --- Main ---
+class BossTimer(QWidget):
+    VERSION = "1.0.36"
+
+    def __init__(self):
+        super().__init__()
+        self.quit_app = False
+        self.ringing = False
+        self.alerts = []  # list of AlertWindow refs
+        self.timers_data = []  # list of dicts using epoch seconds
+        self.warning_threshold_seconds = 180
+        self.table_row_to_data_index = {}
+        self.data_index_to_table_row = {}
+        self.editing_rows = set()
+        self.is_rebuilding = False
+
+        self._setup_ui()
+        self._create_resources()
+        self._setup_media_player()
+        self._setup_timers()
+        self._setup_tray_icon()
+        self._load_config()
+        self._sort_and_rebuild_table()
+
+    def resource_path(self, relative: str) -> str:
+        base = getattr(sys, '_MEIPASS', os.path.abspath('.'))
+        return str(Path(base) / relative)
+
+    @handle_exceptions
+    def _create_resources(self):
+        try:
+            sounds = Path(self.resource_path('sounds'))
+            sounds.mkdir(parents=True, exist_ok=True)
+            alarm = sounds / 'alarm.wav'
+            warning = sounds / 'warning.wav'
+            if not alarm.exists():
+                alarm.write_bytes(
+                    b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x44\xac\x00\x00\x88\xac\x00\x00\x02\x00\x10\x00data\x00\x00\x00\x00")
+            if not warning.exists():
+                warning.write_bytes(
+                    b"RIFF\x24\x00\x00\x00WAVEfmt \x10\x00\x00\x00\x01\x00\x01\x00\x44\xac\x00\x00\x88\xac\x00\x00\x02\x00\x10\x00data\x00\x00\x00\x00")
+        except OSError as e:
+            logging.error(f"创建资源失败: {e}")
+            QMessageBox.critical(self, "资源错误", f"无法创建声音文件: {e}")
+
+    @handle_exceptions
+    def _setup_ui(self):
+        self.setWindowTitle(f"BOSS定时预警系统 v{self.VERSION}")
+        self.resize(1080, 620)
+        QApplication.setFont(QFont('Microsoft YaHei', 11))
+
+        self.setStyleSheet('''
+            QWidget { font-family: 'Microsoft YaHei'; font-size: 12px; }
+            QTableWidget { font-size: 13px; }
+            QPushButton { border-radius:8px; padding:6px 10px; }
+        ''')
+
+        top_layout = QHBoxLayout()
+        self.title_label = QLabel("BOSS定时预警系统")
+        self.title_label.setStyleSheet('font-size:22px; font-weight:bold; color:#2F4F7B;')
+        self.version_label = QLabel(f"v{self.VERSION}")
+        self.time_label = QLabel('')
+        self.mem_label = QLabel('内存: -- MB')
+        top_layout.addWidget(self.title_label)
+        top_layout.addStretch()
+        top_layout.addWidget(self.version_label)
+        top_layout.addWidget(self.mem_label)
+
+        self.table = QTableWidget(0, 8)
+        headers = ["序号", "BOSS名称", "刷新周期", "剩余时间(分)", "刷新时间", "倒计时", "备注", "操作"]
+        self.table.setHorizontalHeaderLabels(headers)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        self.table.setColumnWidth(0, 40)
+        for col in range(1, self.table.columnCount()):
+            self.table.horizontalHeader().setSectionResizeMode(col, QHeaderView.ResizeMode.Stretch)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+
+        ctrl_layout = QHBoxLayout()
+        self.new_btn = QPushButton('新建计时器')
+        self.new_btn.setStyleSheet("background-color: #4CAF50; color: white; font-weight: bold; border-radius: 6px;")
+        self.delete_btn = QPushButton('删除选中')
+        self.delete_btn.setStyleSheet("background-color: #F44336; color: white; font-weight: bold; border-radius: 6px;")
+
+        # 新增的保存按钮
+        self.save_btn = QPushButton('保存配置')
+        self.save_btn.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; border-radius: 6px;")
+
+        # 新增的退出按钮
+        self.exit_btn = QPushButton('退出')
+        self.exit_btn.setStyleSheet("background-color: #757575; color: white; font-weight: bold; border-radius: 6px;")
+
+        self.stop_alarm_btn = QPushButton('静音')
+        self.stop_alarm_btn.setStyleSheet(
+            "background-color: #FF9800; color: white; font-weight: bold; border-radius: 6px;")
+        self.test_btn = QPushButton('测试声音')
+        self.test_btn.setStyleSheet("background-color: #2196F3; color: white; font-weight: bold; border-radius: 6px;")
+
+        ctrl_layout.addWidget(self.new_btn)
+        ctrl_layout.addWidget(self.delete_btn)
+        ctrl_layout.addWidget(self.save_btn)
+        ctrl_layout.addWidget(self.exit_btn)  # 添加退出按钮
+        ctrl_layout.addStretch()
+        ctrl_layout.addWidget(self.stop_alarm_btn)
+        ctrl_layout.addWidget(self.test_btn)
+
+        settings_layout = QHBoxLayout()
+        self.warning_spin = QSpinBox()
+        self.warning_spin.setRange(1, 3600)
+        self.warning_spin.setValue(self.warning_threshold_seconds)
+        self.volume_slider = QSlider(Qt.Orientation.Horizontal)
+        self.volume_slider.setRange(0, 100)
+        self.volume_slider.setValue(70)
+        settings_layout.addWidget(QLabel('提前警告(s):'))
+        settings_layout.addWidget(self.warning_spin)
+        settings_layout.addStretch()
+        settings_layout.addWidget(QLabel('音量:'))
+        settings_layout.addWidget(self.volume_slider)
+
+        bottom_layout = QHBoxLayout()
+        self.credit_label = QLabel('制作: 米哈游')
+        self.contact_label = QLabel('996传奇盒子')
+        bottom_layout.addWidget(self.credit_label)
+        bottom_layout.addStretch()
+        bottom_layout.addWidget(self.contact_label)
+
+        main = QVBoxLayout(self)
+        main.addLayout(top_layout)
+        main.addWidget(self.time_label)
+        main.addWidget(self.table)
+        main.addLayout(ctrl_layout)
+        main.addLayout(settings_layout)
+        main.addLayout(bottom_layout)
+
+        # connections
+        self.new_btn.clicked.connect(self.add_boss_row)
+        self.delete_btn.clicked.connect(self.delete_selected_row)
+        self.save_btn.clicked.connect(lambda: self.save_config())
+        self.exit_btn.clicked.connect(self._quit_app)  # 连接退出按钮
+        self.stop_alarm_btn.clicked.connect(self.stop_alarm_sound)
+        self.test_btn.clicked.connect(self.test_audio)
+        self.volume_slider.valueChanged.connect(self.adjust_volume)
+        self.warning_spin.valueChanged.connect(self.set_warning_threshold)
+
+        # table cell change
+        self.table.cellChanged.connect(self.handle_cell_change)
+
+    @handle_exceptions
+    def _setup_media_player(self):
+        self.media_player = QMediaPlayer(self)
+        self.audio_output = QAudioOutput(self)
+        self.media_player.setAudioOutput(self.audio_output)
+        try:
+            self.audio_output.setVolume(self.volume_slider.value() / 100.0)
+        except Exception:
+            pass
+
+    def _setup_timers(self):
+        self.clock_timer = QTimer(self)
+        self.clock_timer.timeout.connect(self.update_clock)
+        self.clock_timer.start(1000)
+
+        self.refresh_timer = QTimer(self)
+        self.refresh_timer.timeout.connect(self.refresh_all_timers)
+        self.refresh_timer.start(1000)
+
+        self.mem_timer = QTimer(self)
+        self.mem_timer.timeout.connect(self.log_memory_usage)
+        self.mem_timer.start(60000)
+
+    def update_clock(self):
+        self.time_label.setText(time.strftime('系统时间: %Y年%m月%d日 %H:%M:%S', time.localtime()))
+
+    @handle_exceptions
+    def log_memory_usage(self):
+        try:
+            import psutil
+            mem = psutil.Process(os.getpid()).memory_info().rss // (1024 ** 2)
+            self.mem_label.setText(f"内存: {mem} MB")
+            logging.info(f"内存使用: {mem}MB")
+        except ImportError:
+            self.mem_label.setText("内存: psutil未安装")
+        except Exception as e:
+            logging.error(f"内存监控错误: {e}")
+
+    @handle_exceptions
+    def add_boss_row(self, *args, **kwargs):
+        now_ts = int(time.time())
+        self.timers_data.append({
+            'name': '新BOSS',
+            'refresh_cycle_seconds': 3600,
+            'remaining_seconds': 0,
+            'next_refresh_ts': None,
+            'notes': '',
+            'warned': False,
+            'alerted': False
+        })
+        self._sort_and_rebuild_table()
+
+    @handle_exceptions
+    def _sort_and_rebuild_table(self):
+        if self.is_rebuilding:
+            return
+        self.is_rebuilding = True
+
+        # stop live refresh while rebuilding UI
+        self.refresh_timer.stop()
+        try:
+            self.table.blockSignals(True)
+        except Exception:
+            pass
+
+        try:
+            # Sort logic improvement: prioritize "refreshed" timers at the top.
+            def keyfn(d):
+                rem = d.get('remaining_seconds')
+
+                # Timers that are already refreshed (rem <= 0) go to the top.
+                if rem is None or rem <= 0:
+                    return -float('inf')
+
+                # All other running timers are sorted by their remaining time, from least to most.
+                return rem
+
+            # Sort timers_data using the new key function
+            self.timers_data.sort(key=keyfn)
+
+            self.table.setRowCount(len(self.timers_data))
+            self.table_row_to_data_index.clear()
+            self.data_index_to_table_row.clear()
+
+            for r, data in enumerate(self.timers_data):
+                self.table_row_to_data_index[r] = r
+                self.data_index_to_table_row[r] = r
+
+                it_idx = QTableWidgetItem(str(r + 1))
+                it_idx.setFlags(it_idx.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                it_idx.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.table.setItem(r, 0, it_idx)
+
+                it_name = QTableWidgetItem(str(data.get('name', '新BOSS')))
+                it_name.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.table.setItem(r, 1, it_name)
+
+                w_refresh = TimeInputWidget()
+                w_refresh.set_total_seconds(data.get('refresh_cycle_seconds', 0))
+                w_refresh.editingFinished.connect(functools.partial(self._handle_time_widget_change, r, 2))
+                w_refresh.editingStarted.connect(lambda rr=r: self.editing_rows.add(rr))
+                self.table.setCellWidget(r, 2, w_refresh)
+
+                w_remain = TimeInputWidget()
+                w_remain.set_total_seconds(data.get('remaining_seconds', 0))
+                w_remain.editingFinished.connect(functools.partial(self._handle_time_widget_change, r, 3))
+                w_remain.editingStarted.connect(lambda rr=r: self.editing_rows.add(rr))
+                self.table.setCellWidget(r, 3, w_remain)
+
+                nr_ts = data.get('next_refresh_ts')
+                rt_str = time.strftime('%H:%M:%S', time.localtime(nr_ts)) if nr_ts else '未计时'
+                it_rt = QTableWidgetItem(rt_str)
+                it_rt.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                self.table.setItem(r, 4, it_rt)
+
+                lbl_cd = QLabel('未计时')
+                lbl_cd.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                lbl_cd.setFont(QFont('Microsoft YaHei', 20, QFont.Weight.Bold))
+                lbl_cd.setFixedSize(150, 40)
+                lbl_cd.setStyleSheet(
+                    "padding: 2px; color: #333333; border: 1px solid #CCCCCC; border-radius: 5px;"
+                )
+                self.table.setCellWidget(r, 5, lbl_cd)
+
+                le_notes = QLineEdit(str(data.get('notes', '')))
+                le_notes.setAlignment(Qt.AlignmentFlag.AlignCenter)
+                le_notes.editingFinished.connect(functools.partial(self._handle_notes_edit, r))
+                le_notes.textChanged.connect(lambda _, rr=r: self.editing_rows.add(rr))
+                self.table.setCellWidget(r, 6, le_notes)
+
+                act_w = QWidget()
+                act_l = QHBoxLayout(act_w)
+                act_l.setContentsMargins(0, 0, 0, 0)
+                act_l.setSpacing(6)
+
+                btn_clear = QPushButton('清空')
+                btn_clear.setFixedSize(56, 26)
+                btn_clear.setStyleSheet(
+                    "background-color: #FF9800; color: white; border-radius: 5px; font-weight: bold;")
+                btn_clear.clicked.connect(functools.partial(self._clear_notes, r))
+
+                btn_reset = QPushButton('重新计时')
+                btn_reset.setFixedSize(82, 26)
+                btn_reset.setStyleSheet(
+                    "background-color: #2196F3; color: white; border-radius: 5px; font-weight: bold;")
+                btn_reset.clicked.connect(functools.partial(self.reset_timer, r))
+
+                act_l.addWidget(btn_clear)
+                act_l.addWidget(btn_reset)
+                self.table.setCellWidget(r, 7, act_w)
+
+        except Exception as e:
+            logging.exception("重建表格时出错")
+            QMessageBox.critical(self, "错误", f"重建表格时出错: {e}")
+        finally:
+            try:
+                self.table.blockSignals(False)
+            except Exception:
+                pass
+            self.refresh_timer.start(1000)
+            self.is_rebuilding = False
+            # immediate refresh to update UI states
+            self.refresh_all_timers()
+
+    def _handle_time_widget_change(self, row, column, total_seconds):
+        # column: 2 -> refresh_cycle_seconds, 3 -> remaining_seconds
+        if row < 0 or row >= len(self.timers_data):
+            return
+        idx = self.table_row_to_data_index.get(row)
+        if idx is None:
+            return
+        d = self.timers_data[idx]
+        if column == 2:
+            d['refresh_cycle_seconds'] = int(total_seconds)
+        elif column == 3:
+            d['remaining_seconds'] = int(total_seconds)
+            if total_seconds > 0:
+                now_ts = int(time.time())
+                d['next_refresh_ts'] = now_ts + int(total_seconds)
+            else:
+                d['next_refresh_ts'] = None
+
+        if row in self.editing_rows:
+            self.editing_rows.discard(row)
+        self._update_row_ui(row)
+        self._sort_and_rebuild_table()
+
+    def _handle_notes_edit(self, row):
+        if row < 0 or row >= len(self.timers_data):
+            return
+        idx = self.table_row_to_data_index.get(row)
+        if idx is None:
+            return
+        widget = self.table.cellWidget(row, 6)
+        text = ''
+        if isinstance(widget, QLineEdit):
+            text = widget.text()
+        self.timers_data[idx]['notes'] = text
+        if row in self.editing_rows:
+            self.editing_rows.discard(row)
+        self._update_row_ui(row)
+
+    def handle_cell_change(self, row, col):
+        # only name column is editable
+        if col == 1:
+            if row < 0 or row >= len(self.timers_data):
+                return
+            idx = self.table_row_to_data_index.get(row)
+            if idx is None:
+                return
+            item = self.table.item(row, col)
+            if item:
+                self.timers_data[idx]['name'] = item.text()
+
+    @handle_exceptions
+    def delete_selected_row(self, *args, **kwargs):
+        selected = self.table.selectionModel().selectedRows()
+        if not selected:
+            QMessageBox.information(self, "提示", "请先选择要删除的计时器行。")
+            return
+        rows_to_delete = sorted([s.row() for s in selected], reverse=True)
+        data_indices_to_delete = []
+        for r in rows_to_delete:
+            idx = self.table_row_to_data_index.get(r)
+            if idx is not None:
+                data_indices_to_delete.append(idx)
+        data_indices_to_delete.sort(reverse=True)
+        for idx in data_indices_to_delete:
+            if 0 <= idx < len(self.timers_data):
+                self.timers_data.pop(idx)
+        self._sort_and_rebuild_table()
+
+    def _clear_notes(self, row):
+        if row < 0 or row >= len(self.timers_data):
+            return
+        idx = self.table_row_to_data_index.get(row)
+        if idx is None:
+            return
+        self.timers_data[idx]['notes'] = ''
+        widget = self.table.cellWidget(row, 6)
+        if isinstance(widget, QLineEdit):
+            widget.setText('')
+
+    def reset_timer(self, row):
+        if row < 0 or row >= len(self.timers_data):
+            return
+        idx = self.table_row_to_data_index.get(row)
+        if idx is None:
+            return
+        d = self.timers_data[idx]
+        rc = int(d.get('refresh_cycle_seconds', 0))
+        if rc > 0:
+            now_ts = int(time.time())
+            d['next_refresh_ts'] = now_ts + rc
+            d['remaining_seconds'] = rc
+            d['warned'] = False
+            d['alerted'] = False
+            self._sort_and_rebuild_table()
+
+    def _update_row_ui(self, r):
+        idx = self.table_row_to_data_index.get(r)
+        if idx is None or idx < 0 or idx >= len(self.timers_data):
+            return
+        if r in self.editing_rows:
+            return
+        d = self.timers_data[idx]
+        now_ts = int(time.time())
+        nr_ts = d.get('next_refresh_ts')
+
+        rt_str = time.strftime('%H:%M:%S', time.localtime(nr_ts)) if nr_ts else '未计时'
+        if self.table.item(r, 4):
+            self.table.item(r, 4).setText(rt_str)
+
+        lbl = self.table.cellWidget(r, 5)
+        w_remain = self.table.cellWidget(r, 3)
+        if nr_ts and lbl and isinstance(lbl, QLabel) and w_remain and isinstance(w_remain, TimeInputWidget):
+            rem = nr_ts - now_ts
+            d['remaining_seconds'] = rem
+
+            if rem > 0:
+                h = rem // 3600
+                m = (rem % 3600) // 60
+                s = rem % 60
+                lbl.setText(f"{h:02}:{m:02}:{s:02}")
+                if not w_remain.min_lineedit.hasFocus():
+                    w_remain.set_total_seconds(rem)
+
+                if rem <= self.warning_threshold_seconds and not d.get('warned', False):
+                    self.show_alert(f"{d.get('name', 'BOSS')} 将在 {self.warning_threshold_seconds} 秒后刷新！")
+                    self._play_sound('warning')
+                    d['warned'] = True
+
+                self._set_row_highlight(r, rem <= 120)
+            else:
+                lbl.setText('已刷新')
+                if not w_remain.min_lineedit.hasFocus():
+                    w_remain.set_total_seconds(0)
+                self._set_row_highlight(r, False)
+                if not d.get('alerted', False):
+                    d['alerted'] = True
+                    self._play_sound('alarm')
+
+            if rem <= 120:
+                lbl.setStyleSheet('background:#FFEBEE; color:#C62828; font-weight:bold; font-size:20px;')
+            else:
+                lbl.setStyleSheet('font-size:20px;')
+        else:
+            if lbl and isinstance(lbl, QLabel):
+                lbl.setText('未计时')
+                lbl.setStyleSheet('font-size:20px;')
+
+    def refresh_all_timers(self):
+        for r in range(self.table.rowCount()):
+            if r not in self.editing_rows:
+                self._update_row_ui(r)
+
+        if self.ringing and self.media_player.playbackState() == QMediaPlayer.PlaybackState.StoppedState:
+            self.ringing = False
+
+    def _set_row_highlight(self, row, on):
+        if row < 0 or row >= self.table.rowCount():
+            return
+        for c in range(self.table.columnCount()):
+            itm = self.table.item(row, c)
+            if itm:
+                itm.setBackground(QColor(255, 220, 220) if on else QBrush())
+        lbl = self.table.cellWidget(row, 5)
+        if lbl and isinstance(lbl, QLabel):
+            lbl.setStyleSheet(
+                'background:#FFEBEE;color:#C62828;font-weight:bold; font-size:20px;' if on else 'background:none; color:#333333; border: 1px solid #CCCCCC; border-radius: 5px; font-size:20px;')
+
+    def show_alert(self, message):
+        try:
+            a = AlertWindow(message)
+            a.closed.connect(self._remove_alert)
+            a.show()
+            self.alerts.append(a)
+        except Exception as e:
+            logging.error(f"显示预警窗口时出错: {e}")
+
+    def _remove_alert(self, a):
+        try:
+            if a in self.alerts:
+                try:
+                    self.alerts.remove(a)
+                except ValueError:
+                    pass
+        except Exception:
+            pass
+
+    @handle_exceptions
+    def _play_sound(self, key):
+        try:
+            sounds = Path(self.resource_path('sounds'))
+            filepath = str((sounds / (key + '.wav')).resolve())
+            if Path(filepath).exists():
+                self.media_player.setSource(QUrl.fromLocalFile(filepath))
+                try:
+                    self.audio_output.setVolume(self.volume_slider.value() / 100.0)
+                except Exception:
+                    pass
+                self.media_player.play()
+                self.ringing = True
+            else:
+                QApplication.beep()
+        except Exception as e:
+            logging.error(f'播放声音失败: {e}')
+            QTimer.singleShot(0, QApplication.beep)
+
+    def test_audio(self, *args, **kwargs):
+        self._play_sound('warning')
+        QTimer.singleShot(1500, lambda: self._play_sound('alarm'))
+
+    def stop_alarm_sound(self, *args, **kwargs):
+        try:
+            if self.media_player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+                self.media_player.stop()
+        except Exception:
+            pass
+        self.ringing = False
+
+    def adjust_volume(self, v):
+        v = max(0, min(100, v))
+        try:
+            self.audio_output.setVolume(v / 100.0)
+        except Exception:
+            pass
+
+    def set_warning_threshold(self, v):
+        self.warning_threshold_seconds = int(v)
+
+    @handle_exceptions
+    def _setup_tray_icon(self):
+        self.tray = QSystemTrayIcon(self)
+        icon = QApplication.style().standardIcon(QStyle.StandardPixmap.SP_TitleBarMenuButton)
+        self.tray.setIcon(icon)
+        menu = QMenu()
+        act_show = QAction('显示窗口', self)
+        act_show.triggered.connect(self.show_normal)
+        act_quit = QAction('退出', self)
+        act_quit.triggered.connect(self._quit_app)
+        menu.addAction(act_show)
+        menu.addAction(act_quit)
+        self.tray.setContextMenu(menu)
+        self.tray.show()
+
+    def show_normal(self):
+        self.show()
+        self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized | Qt.WindowState.WindowActive)
+        self.activateWindow()
+
+    def _quit_app(self):
+        self.quit_app = True
+        self.close()
+
+    @handle_exceptions
+    def _load_config(self):
+        p = Path(self.resource_path('boss_config.json'))
+        if not p.exists():
+            logging.info('未找到配置文件')
+            return
+        try:
+            with open(p, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            self.warning_threshold_seconds = data.get('warning_threshold_seconds', self.warning_threshold_seconds)
+            try:
+                self.warning_spin.setValue(self.warning_threshold_seconds)
+            except Exception:
+                pass
+
+            for item in data.get('timers', []):
+                nr = item.get('next_refresh_ts')
+                nr_val = int(nr) if nr is not None else None
+                remaining = int(item.get('remaining_time_seconds', 0))
+                self.timers_data.append({
+                    'name': item.get('name', '新BOSS'),
+                    'refresh_cycle_seconds': int(item.get('refresh_cycle_seconds', 3600)),
+                    'remaining_seconds': remaining,
+                    'next_refresh_ts': nr_val,
+                    'notes': item.get('notes', ''),
+                    'warned': False,
+                    'alerted': False
+                })
+            logging.info('配置加载成功')
+        except Exception as e:
+            logging.exception('加载配置失败')
+            QMessageBox.warning(self, "配置错误", f"加载配置文件时出错: {e}")
+
+    @handle_exceptions
+    def save_config(self):
+        try:
+            cfg = {
+                'warning_threshold_seconds': self.warning_threshold_seconds,
+                'timers': []
+            }
+            for d in self.timers_data:
+                nr = d.get('next_refresh_ts')
+                cfg['timers'].append({
+                    'name': d.get('name', ''),
+                    'refresh_cycle_seconds': int(d.get('refresh_cycle_seconds', 0)),
+                    'remaining_time_seconds': int(d.get('remaining_seconds', 0)),
+                    'next_refresh_ts': int(nr) if nr else None,
+                    'notes': d.get('notes', '')
+                })
+            p = Path(self.resource_path('boss_config.json'))
+            with open(p, 'w', encoding='utf-8') as f:
+                json.dump(cfg, f, ensure_ascii=False, indent=2)
+            logging.info('配置保存成功')
+            QMessageBox.information(self, "保存成功", "计时器配置已保存。")
+        except Exception as e:
+            logging.exception('保存配置失败')
+            QMessageBox.critical(self, "保存失败", f"无法保存配置: {e}")
+
+    def closeEvent(self, ev):
+        if self.quit_app:
+            # 移除自动保存逻辑，现在由按钮触发
+            for a in list(self.alerts):
+                try:
+                    if a.isVisible():
+                        a.close()
+                except Exception:
+                    pass
+
+            try:
+                self.media_player.stop()
+                self.media_player.deleteLater()
+            except Exception:
+                pass
+
+            try:
+                self.clock_timer.stop()
+                self.refresh_timer.stop()
+                self.mem_timer.stop()
+            except Exception:
+                pass
+
+            ev.accept()
+        else:
+            ev.ignore()
+            self.hide()
+            try:
+                self.tray.showMessage('BOSS计时器', '程序已最小化到托盘。', QSystemTrayIcon.MessageIcon.Information,
+                                      2000)
+            except Exception:
+                pass
+
+
+if __name__ == '__main__':
+    # attempt to detach console on windows if desired
+    if sys.platform == 'win32' and os.getenv('NO_CONSOLE') != '1':
+        try:
+            import ctypes
+
+            ctypes.windll.kernel32.FreeConsole()
+        except Exception:
+            pass
+
+    app = QApplication(sys.argv)
+
+
+    def excepthook(exctype, value, traceback):
+        logging.error("未捕获的异常", exc_info=(exctype, value, traceback))
+        try:
+            QMessageBox.critical(None, "致命错误", f"未处理的异常:\n{value}")
+        except Exception:
+            pass
+        sys.exit(1)
+
+
+    sys.excepthook = excepthook
+
+    window = BossTimer()
+    window.show()
+    sys.exit(app.exec())
